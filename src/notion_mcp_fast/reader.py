@@ -310,8 +310,12 @@ class NotionLocalReader:
             content_ids = safe_json_loads(row["content"])
             has_children = bool(content_ids)
 
-            # Render block content
-            text_content = render_block(block_type, properties)
+            # Render block content (tables need their row children assembled)
+            if block_type == "table":
+                text_content = self._render_table(conn, content_ids, row["format"])
+                has_children = False  # rows consumed into the table; skip recursion
+            else:
+                text_content = render_block(block_type, properties)
 
             block = {
                 "id": block_id,
@@ -328,6 +332,53 @@ class NotionLocalReader:
             blocks.append(block)
 
         return blocks
+
+    def _render_table(
+        self, conn: sqlite3.Connection, row_ids: Any, format_raw: Any
+    ) -> str:
+        """Assemble a Notion table block into a Markdown table.
+
+        Cell text lives in child table_row blocks (properties keyed by column
+        id). Column order and the header flag come from the table block's
+        format; row order follows the table block's content (row id list).
+        """
+        fmt = safe_json_loads(format_raw)
+        col_order = fmt.get("table_block_column_order") or []
+        has_header = bool(fmt.get("table_block_column_header", False))
+
+        row_ids = row_ids if isinstance(row_ids, list) else []
+        if not row_ids:
+            return "[Table]"
+
+        def esc(text: str) -> str:
+            return text.replace("|", "\\|").replace("\n", " ").strip()
+
+        rows: list[list[str]] = []
+        for rid in row_ids:
+            r = conn.execute(
+                "SELECT properties FROM block WHERE id = ? AND alive = 1",
+                (rid,),
+            ).fetchone()
+            props = safe_json_loads(r["properties"]) if r else {}
+            cols = col_order or list(props.keys())
+            rows.append([esc(parse_rich_text(props.get(c, ""))) for c in cols])
+
+        if not rows:
+            return "[Table]"
+
+        ncol = max(len(r) for r in rows)
+        rows = [r + [""] * (ncol - len(r)) for r in rows]  # pad ragged rows
+
+        lines = []
+        if has_header:
+            header, body = rows[0], rows[1:]
+        else:
+            header, body = [""] * ncol, rows
+        lines.append("| " + " | ".join(header) + " |")
+        lines.append("| " + " | ".join(["---"] * ncol) + " |")
+        for r in body:
+            lines.append("| " + " | ".join(r) + " |")
+        return "\n".join(lines)
 
     def search_pages(self, query: str, limit: int = 20) -> list[dict[str, Any]]:
         """
